@@ -166,6 +166,73 @@ def parse_args() -> Tuple[ArgumentParser, Namespace]:
     training_group.add_argument("--seed", type=int, default=0)
     training_group.add_argument("--draft-accumulation-steps", type=int, default=1)
 
+    bita_group = parser.add_argument_group("bita")
+    bita_group.add_argument(
+        "--use-bita",
+        action="store_true",
+        help="Enable the BiTA-style prompt/mask auxiliary objective for the draft model.",
+    )
+    bita_group.add_argument(
+        "--bita-ckpt-dir",
+        type=str,
+        default=None,
+        help="Directory containing a previously saved standalone BiTA adapter checkpoint.",
+    )
+    bita_group.add_argument(
+        "--bita-mask-num",
+        type=int,
+        default=4,
+        help="Number of future tokens predicted in each BiTA auxiliary block.",
+    )
+    bita_group.add_argument(
+        "--bita-max-groups",
+        type=int,
+        default=2,
+        help="Maximum number of contiguous BiTA auxiliary anchor groups per sample.",
+    )
+    bita_group.add_argument(
+        "--bita-prompt-num",
+        type=int,
+        default=16,
+        help="Number of learnable BiTA prompt tokens.",
+    )
+    bita_group.add_argument(
+        "--bita-prefix-hidden-size",
+        type=int,
+        default=512,
+        help="Hidden size for the BiTA prefix projection MLP.",
+    )
+    bita_group.add_argument(
+        "--bita-prefix-dropout-prob",
+        type=float,
+        default=0.0,
+        help="Dropout applied to the BiTA prompt key/value cache.",
+    )
+    bita_group.add_argument(
+        "--bita-loss-weight",
+        type=float,
+        default=0.5,
+        help="Weight applied to the BiTA auxiliary loss before it is added to the main Eagle3 loss.",
+    )
+    bita_group.add_argument(
+        "--bita-window-strategy",
+        type=str,
+        default="random",
+        choices=["random", "tail"],
+        help="How to choose the contiguous anchor window for the BiTA auxiliary task.",
+    )
+    bita_group.add_argument(
+        "--bita-mask-diff",
+        action="store_true",
+        help="Use a different learnable mask embedding for each future position in a BiTA block.",
+    )
+    bita_group.add_argument(
+        "--bita-prefix-projection",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Use a two-layer MLP to project BiTA prompt embeddings into KV tensors.",
+    )
+
     # data processing type
     optimization_group = parser.add_argument_group("optimization")
     optimization_group.add_argument(
@@ -339,6 +406,23 @@ def sanity_check(args: Namespace) -> None:
     """
     args.dp_size = dist.get_world_size() // args.tp_size
     args.target_batch_size = args.tp_size * args.batch_size
+    if args.use_bita:
+        if args.ckpt_dir is None:
+            raise ValueError(
+                "--ckpt-dir must point to a trained base draft checkpoint when --use-bita is set."
+            )
+        if args.attention_backend != "sdpa":
+            raise ValueError(
+                "The current BiTA training path only supports --attention-backend sdpa."
+            )
+        if args.is_vlm:
+            raise ValueError("The current BiTA training path does not support VLM models.")
+        if args.bita_mask_num <= 0:
+            raise ValueError("--bita-mask-num must be > 0 when --use-bita is set.")
+        if args.bita_max_groups <= 0:
+            raise ValueError("--bita-max-groups must be > 0 when --use-bita is set.")
+        if args.bita_prompt_num < 0:
+            raise ValueError("--bita-prompt-num must be >= 0.")
     if args.attention_backend == "usp":
         sp_sanity_check(args)
 
@@ -366,6 +450,40 @@ def sp_sanity_check(args: Namespace) -> None:
         )
 
 
+def apply_bita_config_overrides(
+    args: Namespace, draft_model_config: AutoDraftModelConfig
+) -> AutoDraftModelConfig:
+    if not args.use_bita:
+        return draft_model_config
+
+    setattr(draft_model_config, "bita_mask_num", args.bita_mask_num)
+    setattr(draft_model_config, "bita_mask_diff", args.bita_mask_diff)
+    setattr(draft_model_config, "bita_prompt_num", args.bita_prompt_num)
+    setattr(
+        draft_model_config,
+        "bita_prefix_projection",
+        args.bita_prefix_projection,
+    )
+    setattr(
+        draft_model_config,
+        "bita_prefix_hidden_size",
+        args.bita_prefix_hidden_size,
+    )
+    setattr(
+        draft_model_config,
+        "bita_prefix_dropout_prob",
+        args.bita_prefix_dropout_prob,
+    )
+    setattr(draft_model_config, "bita_loss_weight", args.bita_loss_weight)
+    setattr(draft_model_config, "bita_max_groups", args.bita_max_groups)
+    setattr(
+        draft_model_config,
+        "bita_window_strategy",
+        args.bita_window_strategy,
+    )
+    return draft_model_config
+
+
 def build_draft_model(args: Namespace) -> Tuple[AutoDraftModelConfig, nn.Module]:
     # ckpt info(epoch, step)
     ckpt_info = (0, 0)
@@ -382,30 +500,39 @@ def build_draft_model(args: Namespace) -> Tuple[AutoDraftModelConfig, nn.Module]
         draft_model_config = AutoDraftModelConfig.from_file(args.draft_model_config)
 
     # Handle base ckpt, config file
-    draft_model_last_checkpoint = None
+    base_draft_checkpoint = None
+    bita_checkpoint_to_load = args.bita_ckpt_dir
     is_resume_checkpoint = False
     if args.ckpt_dir is not None:
         if os.path.isdir(args.ckpt_dir):
             draft_model_config = AutoDraftModelConfig.from_file(
                 os.path.join(args.ckpt_dir, "config.json")
             )
-            draft_model_last_checkpoint = args.ckpt_dir
-            print_on_rank0(f"Finetuning from base model: {draft_model_last_checkpoint}")
+            base_draft_checkpoint = args.ckpt_dir
+            print_on_rank0(f"Finetuning from base model: {base_draft_checkpoint}")
         else:
             raise ValueError(
                 f"Provided base model dir {args.ckpt_dir} is not a valid directory."
             )
 
-    # detecting last ckpt for draft model
+    # detecting last ckpt for resume
+    resume_checkpoint = None
     if args.resume and os.path.isdir(args.output_dir):
         print_on_rank0(args.output_dir)
-        draft_model_last_checkpoint, ckpt_info = get_last_checkpoint(args.output_dir)
-        print(f"Last checkpoint detected: {draft_model_last_checkpoint}")
+        resume_checkpoint, ckpt_info = get_last_checkpoint(args.output_dir)
+        print(f"Last checkpoint detected: {resume_checkpoint}")
         is_resume_checkpoint = True
+        if args.use_bita:
+            bita_checkpoint_to_load = resume_checkpoint
+        else:
+            base_draft_checkpoint = resume_checkpoint
 
-    if draft_model_last_checkpoint:
+    draft_model_config = apply_bita_config_overrides(args, draft_model_config)
+
+    if base_draft_checkpoint:
         draft_model = AutoEagle3DraftModel.from_pretrained(
-            draft_model_last_checkpoint,
+            base_draft_checkpoint,
+            config=draft_model_config,
             attention_backend=args.attention_backend,
             torch_dtype=torch.bfloat16,
         ).cuda()
@@ -418,9 +545,9 @@ def build_draft_model(args: Namespace) -> Tuple[AutoDraftModelConfig, nn.Module]
 
     # Load training state (optimizer, scheduler, epoch, step) for true resume
     resume_state = None
-    if is_resume_checkpoint and draft_model_last_checkpoint:
+    if is_resume_checkpoint and resume_checkpoint:
         training_state_path = os.path.join(
-            draft_model_last_checkpoint, "training_state.pt"
+            resume_checkpoint, "training_state.pt"
         )
         if os.path.exists(training_state_path):
             resume_state = torch.load(
@@ -432,7 +559,23 @@ def build_draft_model(args: Namespace) -> Tuple[AutoDraftModelConfig, nn.Module]
             )
 
     draft_model.load_embedding(args.target_model_path, embedding_key=args.embedding_key)
-    draft_model.freeze_embedding()
+    if args.use_bita and bita_checkpoint_to_load is not None:
+        if not hasattr(draft_model, "load_bita_pretrained"):
+            raise NotImplementedError(
+                f"{draft_model.__class__.__name__} does not support standalone BiTA loading."
+            )
+        draft_model.load_bita_pretrained(bita_checkpoint_to_load)
+        print_on_rank0(f"Loaded BiTA adapter from {bita_checkpoint_to_load}")
+
+    if args.use_bita:
+        if not hasattr(draft_model, "freeze_non_bita_parameters"):
+            raise NotImplementedError(
+                f"{draft_model.__class__.__name__} does not support BiTA-only training."
+            )
+        draft_model.freeze_non_bita_parameters()
+        print_on_rank0("Froze all base draft parameters and left only BiTA parameters trainable.")
+    else:
+        draft_model.freeze_embedding()
     return draft_model_config, draft_model, ckpt_info, resume_state
 
 
@@ -569,11 +712,6 @@ def save_checkpoints(
             "args": args,
         }
         state_to_save.update(optimizer.state_dict())
-        draft_model_state_dict = {
-            k.replace("draft_model.", ""): v
-            for k, v in model_state_dict.items()
-            if "draft_model." in k and "embed" not in k.lower()
-        }
 
         if dist.get_rank() == 0:
             torch.save(
@@ -583,11 +721,28 @@ def save_checkpoints(
             print_on_rank0(
                 f"Saved full training state to {epoch_output_dir}/training_state.pt"
             )
-            eagle3_model.draft_model.save_pretrained(
-                epoch_output_dir,
-                state_dict=draft_model_state_dict,
-            )
-            print_on_rank0(f"Saved model configuration to {epoch_output_dir}")
+            if args.use_bita:
+                bita_state_dict = {
+                    k.replace("draft_model.", ""): v
+                    for k, v in model_state_dict.items()
+                    if k.startswith("draft_model.bita_")
+                }
+                eagle3_model.draft_model.save_bita_pretrained(
+                    epoch_output_dir,
+                    state_dict=bita_state_dict,
+                )
+                print_on_rank0(f"Saved standalone BiTA adapter to {epoch_output_dir}")
+            else:
+                draft_model_state_dict = {
+                    k.replace("draft_model.", ""): v
+                    for k, v in model_state_dict.items()
+                    if "draft_model." in k and "embed_tokens" not in k.lower()
+                }
+                eagle3_model.draft_model.save_pretrained(
+                    epoch_output_dir,
+                    state_dict=draft_model_state_dict,
+                )
+                print_on_rank0(f"Saved model configuration to {epoch_output_dir}")
         dist.barrier()
 
 
@@ -597,7 +752,7 @@ def run_forward(
     data: dict,
     target_model: Optional[Eagle3TargetModel] = None,
     is_online: bool = True,
-) -> Tuple[List[torch.Tensor], List[torch.Tensor]]:
+) -> Tuple[List[torch.Tensor], List[torch.Tensor], dict]:
     if args.is_vlm and args.target_model_backend == "custom":
         plosses, _, acces = eagle3_model(
             input_ids=data["input_ids"].cuda(),
@@ -606,6 +761,7 @@ def run_forward(
             pixel_values=data["pixel_values"].cuda(),
             image_grid_thw=data["image_grid_thw"].cuda(),
         )
+        vlosses = []
     else:
         image_grid_thw = None
         if is_online:
@@ -651,7 +807,7 @@ def run_forward(
                 target.cuda()
             )  # The `data['target']` value occupies a large amount of GPU memory, with a shape of [seqlen, vocab_size]. It needs to be processed before being loaded into the GPU.
             loss_mask = loss_mask.cuda()
-        plosses, _, acces = eagle3_model(
+        plosses, vlosses, acces = eagle3_model(
             input_ids=input_ids,
             attention_mask=attention_mask,
             loss_mask=loss_mask,
@@ -663,7 +819,13 @@ def run_forward(
             image_grid_thw=image_grid_thw,
             is_vlm=args.is_vlm,
         )
-    return plosses, acces
+    extra_metrics = {}
+    if len(vlosses) >= 2:
+        extra_metrics = {
+            "bita_loss": vlosses[0],
+            "bita_acc": vlosses[1],
+        }
+    return plosses, acces, extra_metrics
 
 
 def run_backward_and_update(
@@ -688,6 +850,7 @@ def record_metrcs(
     tracker: Tracker,
     optimizer: Optional[Optimizer] = None,
     mode: str = "train",
+    extra_metrics: Optional[dict] = None,
 ) -> None:
     logdict = {}
 
@@ -713,6 +876,17 @@ def record_metrcs(
         print_on_rank0(
             f"Eval - Step {global_step} [{global_step + 1}/{args.num_epochs}], position {i}, pLoss: {plosses[i]}"
         )
+
+    if extra_metrics:
+        for metric_name, metric_value in extra_metrics.items():
+            metric_tensor = metric_value.detach().clone()
+            dist.all_reduce(metric_tensor, op=dist.ReduceOp.AVG)
+            metric_scalar = metric_tensor.item()
+            logdict[f"{mode}/{metric_name}"] = metric_scalar
+            print_on_rank0(
+                f"{mode.title()} - Step {global_step} [{global_step + 1}/{args.num_epochs}], "
+                f"{metric_name}: {metric_scalar:.4f}"
+            )
     tracker.log(logdict, step=global_step)
 
 
@@ -909,7 +1083,7 @@ def main():
             # ================================================
             # 7.1 Training Step
             # ================================================
-            plosses, acces = run_forward(
+            plosses, acces, extra_metrics = run_forward(
                 args,
                 eagle3_model,
                 data,
@@ -928,6 +1102,7 @@ def main():
                     tracker,
                     optimizer,
                     mode="train",
+                    extra_metrics=extra_metrics,
                 )
 
             if dist.get_rank() == 0:
@@ -959,10 +1134,11 @@ def main():
                 draft_model.eval()
                 eval_acces = [[] for _ in range(eagle3_model.length)]
                 eval_plosses = [[] for _ in range(eagle3_model.length)]
+                eval_extra_metrics = {}
 
                 for data in tqdm(eval_dataloader, desc=f"Evaluating Epoch {epoch}"):
                     with torch.no_grad():
-                        plosses, acces = run_forward(
+                        plosses, acces, extra_metrics = run_forward(
                             args, eagle3_model, data, target_model, is_online
                         )
                         eval_acces = [
@@ -971,10 +1147,23 @@ def main():
                         eval_plosses = [
                             eval_plosses[i] + [plosses[i]] for i in range(len(plosses))
                         ]
+                        if extra_metrics:
+                            for metric_name, metric_value in extra_metrics.items():
+                                eval_extra_metrics.setdefault(metric_name, []).append(
+                                    metric_value
+                                )
 
                 # compute average over all minibatches
                 eval_acces = [torch.stack(acc).mean() for acc in eval_acces]
                 eval_plosses = [torch.stack(pl).mean() for pl in eval_plosses]
+
+                averaged_eval_extra_metrics = None
+                if eval_extra_metrics:
+                    averaged_eval_extra_metrics = {
+                        name: torch.stack(values).mean()
+                        for name, values in eval_extra_metrics.items()
+                        if len(values) > 0
+                    }
 
                 record_metrcs(
                     args,
@@ -983,6 +1172,7 @@ def main():
                     global_step // args.draft_accumulation_steps,
                     tracker,
                     mode="eval",
+                    extra_metrics=averaged_eval_extra_metrics,
                 )
             # ================================================
             # 7.3 Save Checkpoints

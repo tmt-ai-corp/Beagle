@@ -187,3 +187,26 @@ class Eagle3DraftModel(PreTrainedModel, ABC):
         self.t2d.copy_(vocab_mapping["t2d"])
         self.d2t.copy_(vocab_mapping["d2t"])
         self.vocab_mapping_loaded = True
+
+    @property
+    def supports_bita_training(self) -> bool:
+        return False
+
+    def freeze_non_bita_parameters(self) -> None:
+        if not self.supports_bita_training:
+            raise NotImplementedError(
+                f"{self.__class__.__name__} does not implement BiTA training."
+            )
+
+        for name, parameter in self.named_parameters():
+            parameter.requires_grad = name.startswith("bita_")
+
+    def save_bita_pretrained(self, output_dir: str, state_dict=None) -> None:
+        raise NotImplementedError(
+            f"{self.__class__.__name__} does not implement BiTA checkpoint saving."
+        )
+
+    def load_bita_pretrained(self, input_dir: str, map_location: str = "cpu") -> None:
+        raise NotImplementedError(
+            f"{self.__class__.__name__} does not implement BiTA checkpoint loading."
+        )

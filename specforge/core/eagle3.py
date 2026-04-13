@@ -129,6 +129,253 @@ class OnlineEagle3Model(Eagle3Model):
         position_ids = position_ids.long()
         return position_ids.view(-1, seq_length)
 
+    def _sample_bita_window(
+        self,
+        valid_anchor_mask: torch.Tensor,
+        max_groups: int,
+        strategy: str,
+    ) -> Tuple[int, int]:
+        valid_positions = torch.nonzero(valid_anchor_mask, as_tuple=False).view(-1)
+        if valid_positions.numel() == 0:
+            return 0, 0
+
+        runs = []
+        run_start = int(valid_positions[0].item())
+        prev = run_start
+        for pos in valid_positions[1:]:
+            pos = int(pos.item())
+            if pos != prev + 1:
+                runs.append((run_start, prev))
+                run_start = pos
+            prev = pos
+        runs.append((run_start, prev))
+
+        strategy = strategy.lower()
+        if strategy == "tail":
+            run_start, run_end = runs[-1]
+            start_anchor = max(run_end - max_groups + 1, run_start)
+        else:
+            run_idx = int(
+                torch.randint(len(runs), (1,), device=valid_anchor_mask.device).item()
+            )
+            run_start, run_end = runs[run_idx]
+            start_high = max(run_start, run_end - max_groups + 1)
+            if start_high == run_start:
+                start_anchor = run_start
+            else:
+                start_anchor = int(
+                    torch.randint(
+                        run_start,
+                        start_high + 1,
+                        (1,),
+                        device=valid_anchor_mask.device,
+                    ).item()
+                )
+
+        groups = min(max_groups, run_end - start_anchor + 1)
+        freeze_num = start_anchor + groups
+        return freeze_num, groups
+
+    def _run_bita_auxiliary(
+        self,
+        *,
+        input_ids: torch.Tensor,
+        loss_mask: torch.Tensor,
+        hidden_states: torch.Tensor,
+        target_p_padded: torch.Tensor,
+        position_mask: torch.Tensor,
+        adapter: BackendAdapter,
+    ) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
+        if not getattr(self.draft_model, "supports_bita_training", False):
+            return None, None
+
+        mask_num = int(getattr(self.draft_model, "bita_mask_num", 0) or 0)
+        max_groups = int(getattr(self.draft_model, "bita_max_groups", 1) or 1)
+        strategy = str(getattr(self.draft_model, "bita_window_strategy", "random"))
+        if mask_num <= 0 or max_groups <= 0:
+            return None, None
+
+        batch_size, seq_length, hidden_size = hidden_states.shape
+        draft_vocab_size = target_p_padded.shape[-1]
+        device = hidden_states.device
+        dtype = hidden_states.dtype
+        target_valid = position_mask.squeeze(-1).bool()
+
+        sample_meta = []
+        has_valid_sample = False
+        max_total_len = 1
+        for batch_idx in range(batch_size):
+            valid_anchor_mask = torch.zeros(seq_length, dtype=torch.bool, device=device)
+            for anchor in range(max(seq_length - mask_num, 0)):
+                valid_anchor_mask[anchor] = target_valid[
+                    batch_idx, anchor + 1 : anchor + 1 + mask_num
+                ].all()
+
+            freeze_num, groups = self._sample_bita_window(
+                valid_anchor_mask=valid_anchor_mask,
+                max_groups=max_groups,
+                strategy=strategy,
+            )
+            prefix_len = max(freeze_num, 1)
+            total_len = prefix_len + groups * mask_num
+            max_total_len = max(max_total_len, total_len)
+            has_valid_sample = has_valid_sample or groups > 0
+            sample_meta.append(
+                {
+                    "freeze_num": freeze_num,
+                    "groups": groups,
+                    "prefix_len": prefix_len,
+                    "total_len": total_len,
+                }
+            )
+
+        if not has_valid_sample:
+            return None, None
+
+        aux_input_embeds = torch.zeros(
+            batch_size, max_total_len, hidden_size, device=device, dtype=dtype
+        )
+        aux_hidden_states = torch.zeros_like(aux_input_embeds)
+        aux_valid_mask = torch.zeros(
+            batch_size, max_total_len, device=device, dtype=torch.bool
+        )
+        aux_target_p = torch.zeros(
+            batch_size,
+            max_total_len,
+            draft_vocab_size,
+            device=device,
+            dtype=target_p_padded.dtype,
+        )
+        aux_position_mask = torch.zeros(
+            batch_size, max_total_len, 1, device=device, dtype=position_mask.dtype
+        )
+
+        for batch_idx, meta in enumerate(sample_meta):
+            prefix_len = meta["prefix_len"]
+            total_len = meta["total_len"]
+            groups = meta["groups"]
+            freeze_num = meta["freeze_num"]
+            aux_valid_mask[batch_idx, :total_len] = True
+
+            prefix_embeds = self.draft_model.embed_input_ids(
+                input_ids[batch_idx : batch_idx + 1, :prefix_len]
+            ).to(dtype=dtype)
+            aux_input_embeds[batch_idx, :prefix_len] = prefix_embeds[0]
+            aux_hidden_states[batch_idx, :prefix_len] = hidden_states[
+                batch_idx, :prefix_len
+            ]
+
+            if groups <= 0:
+                continue
+
+            mask_embeds = self.draft_model.get_bita_mask_embeddings(
+                groups=groups,
+                device=device,
+                dtype=dtype,
+            )
+            aux_input_embeds[
+                batch_idx, prefix_len : prefix_len + groups * mask_num
+            ] = mask_embeds
+
+            for group_idx in range(groups):
+                anchor = freeze_num - groups + group_idx
+                for mask_idx in range(mask_num):
+                    row_idx = prefix_len + group_idx * mask_num + mask_idx
+                    target_idx = anchor + 1 + mask_idx
+                    aux_target_p[batch_idx, row_idx] = target_p_padded[
+                        batch_idx, target_idx
+                    ]
+                    aux_position_mask[batch_idx, row_idx] = position_mask[
+                        batch_idx, target_idx
+                    ]
+
+        aux_attention_mask = self.draft_model.prepare_decoder_attention_mask(
+            attention_mask=aux_valid_mask,
+            hidden_states=aux_hidden_states,
+            batch_size=batch_size,
+            seq_length=max_total_len,
+            past_key_values_length=0,
+        )
+
+        if aux_attention_mask is None:
+            aux_attention_mask = torch.zeros(
+                batch_size,
+                1,
+                max_total_len,
+                max_total_len,
+                device=device,
+                dtype=dtype,
+            )
+
+        for batch_idx, meta in enumerate(sample_meta):
+            freeze_num = meta["freeze_num"]
+            groups = meta["groups"]
+            if groups <= 0:
+                continue
+
+            for group_idx in range(groups):
+                start_idx = freeze_num + group_idx * mask_num
+                hidden_prefix_start = freeze_num - groups + group_idx + 1
+                aux_attention_mask[
+                    batch_idx,
+                    0,
+                    start_idx : start_idx + mask_num,
+                    hidden_prefix_start:freeze_num,
+                ] = torch.finfo(aux_attention_mask.dtype).min
+                if group_idx > 0:
+                    aux_attention_mask[
+                        batch_idx,
+                        0,
+                        start_idx:,
+                        start_idx - mask_num : start_idx,
+                    ] = torch.finfo(aux_attention_mask.dtype).min
+
+        aux_position_ids = (aux_attention_mask == 0).sum(dim=-1).squeeze(1).long() - 1
+
+        prompt_key_values = self.draft_model.get_bita_prompt_key_values(
+            batch_size=batch_size,
+            device=device,
+            dtype=dtype,
+        )
+        if prompt_key_values is not None:
+            prompt_len = prompt_key_values[0].shape[-2]
+            prompt_attention_mask = torch.full(
+                (batch_size, 1, max_total_len, prompt_len),
+                torch.finfo(aux_attention_mask.dtype).min,
+                device=device,
+                dtype=aux_attention_mask.dtype,
+            )
+            for batch_idx, meta in enumerate(sample_meta):
+                if meta["groups"] <= 0:
+                    continue
+                prompt_attention_mask[
+                    batch_idx, 0, meta["freeze_num"] : meta["total_len"]
+                ] = 0
+            aux_attention_mask = torch.cat(
+                [prompt_attention_mask, aux_attention_mask], dim=-1
+            )
+
+        aux_hidden_out = self.draft_model.backbone(
+            input_embeds=aux_input_embeds,
+            hidden_states=aux_hidden_states,
+            cache_hidden=None,
+            attention_mask=aux_attention_mask,
+            position_ids=aux_position_ids,
+            past_key_values=None,
+            prompt_key_values=prompt_key_values,
+            use_cache=False,
+        )
+        aux_logits = self.draft_model.compute_logits(aux_hidden_out)
+        aux_loss_mask = aux_position_mask.squeeze(-1)
+        aux_acc, aux_loss = self._acc_and_loss(
+            logits=aux_logits,
+            target_p=aux_target_p,
+            position_mask=aux_position_mask,
+            loss_mask=aux_loss_mask,
+            adapter=adapter,
+        )
+        return aux_loss, aux_acc
+
     def forward(
         self,
         input_ids: torch.Tensor,
@@ -205,6 +452,10 @@ class OnlineEagle3Model(Eagle3Model):
         vlosses = []
         acces = []
         adapter = self._make_adapter()
+        base_input_ids = input_ids
+        base_loss_mask = loss_mask
+        base_hidden_states = hidden_states
+        base_position_mask = position_mask
         # for sequence paralle, position mask and input ids will split by sequence dim, need to keep origin for ttt shift
         global_input_ids = input_ids
         if self.attention_backend in ["sdpa", "fa", "usp"]:
@@ -269,6 +520,21 @@ class OnlineEagle3Model(Eagle3Model):
                 position_mask = padding(position_mask, left=False)
                 loss_mask = padding(loss_mask, left=False)
                 # Flex attention mask shirnking is handled inside attention module
+
+        bita_loss, bita_acc = self._run_bita_auxiliary(
+            input_ids=base_input_ids,
+            loss_mask=base_loss_mask,
+            hidden_states=base_hidden_states,
+            target_p_padded=target_p_padded,
+            position_mask=base_position_mask,
+            adapter=adapter,
+        )
+        if bita_loss is not None:
+            plosses[0] = (
+                plosses[0]
+                + getattr(self.draft_model, "bita_loss_weight", 1.0) * bita_loss
+            )
+            vlosses = [bita_loss.detach(), bita_acc.detach()]
         return plosses, vlosses, acces
 
 

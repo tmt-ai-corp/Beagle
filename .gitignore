@@ -193,6 +193,7 @@ cython_debug/
 .cursorindexingignore
 cache/
 outputs/
+models/
 wandb/
 .idea
 .vscode/

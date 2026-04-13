@@ -37,6 +37,22 @@ python scripts/prepare_data.py --dataset sharegpt
 bash ./examples/run_llama3.1_8b_eagle3_online.sh
 ```
 
+### BiTA-style auxiliary training on top of an existing Eagle3 draft
+
+For research experiments where you want to continue from an already-trained Eagle3 drafter and add a BiTA-style prompt/mask auxiliary objective, use the H100-oriented example script:
+
+```bash
+bash ./examples/run_llama3.1_8b_eagle3_bita_online_h100.sh
+```
+
+This path currently has a few intentional constraints:
+
+- It is only enabled for the `sdpa` draft attention backend.
+- It is currently wired for text-only draft training, not VLM training.
+- The script expects a frozen base Eagle3 draft checkpoint in `BASE_DRAFT_CKPT`.
+- The training output directory stores the standalone BiTA adapter checkpoint, not a rewritten full draft checkpoint.
+- You can later reconstruct the full experiment by loading the frozen base draft from `BASE_DRAFT_CKPT` and the trained BiTA adapter from the BiTA output directory.
+
 ## 💨 Offline Training
 
 The difference between online and offline training is that we need to generate the hidden states before training. We also use ShareGPT and Llama3-8B-Instruct as an example.

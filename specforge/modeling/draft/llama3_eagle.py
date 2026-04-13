@@ -1,4 +1,6 @@
+import json
 import math
+import os
 import warnings
 from typing import List, Optional, Tuple
 
@@ -21,6 +23,7 @@ from specforge.utils import print_with_rank
 
 from ...distributed import get_sp_ring_group, get_sp_ulysses_group
 from ...layers.ring import ring_flash_attn_func
+from .bita import PrefixEncoder
 from .base import Eagle3DraftModel
 
 try:
@@ -630,6 +633,7 @@ class LlamaAttention(nn.Module):
         attention_mask: Optional[torch.Tensor] = None,
         position_ids: Optional[torch.LongTensor] = None,
         past_key_values: Optional[Cache] = None,
+        prompt_key_values: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
         output_attentions: bool = False,
         use_cache: bool = False,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
@@ -670,6 +674,19 @@ class LlamaAttention(nn.Module):
             key_states = repeat_kv(key_states, self.num_key_value_groups)
             value_states = repeat_kv(value_states, self.num_key_value_groups)
 
+            if prompt_key_values is not None:
+                prompt_k, prompt_v = prompt_key_values
+                prompt_k = repeat_kv(
+                    prompt_k.to(device=key_states.device, dtype=key_states.dtype),
+                    self.num_key_value_groups,
+                )
+                prompt_v = repeat_kv(
+                    prompt_v.to(device=value_states.device, dtype=value_states.dtype),
+                    self.num_key_value_groups,
+                )
+                key_states = torch.cat((prompt_k, key_states), dim=-2)
+                value_states = torch.cat((prompt_v, value_states), dim=-2)
+
             attn_output = torch.nn.functional.scaled_dot_product_attention(
                 query_states,
                 key_states,
@@ -680,6 +697,11 @@ class LlamaAttention(nn.Module):
             )
 
         else:
+            if prompt_key_values is not None:
+                raise NotImplementedError(
+                    "BiTA prompt key-values are only supported on uncached sdpa "
+                    "attention."
+                )
             lck = len(cache_hidden[0])
             if isinstance(self.rotary_emb, LlamaMutiRotaryEmbedding):
                 cos, sin = self.rotary_emb(query_states, position_ids + lck)
@@ -767,9 +789,15 @@ class LlamaFlexAttention(LlamaAttention):
         attention_mask: Optional[torch.Tensor] = None,
         position_ids: Optional[torch.LongTensor] = None,
         past_key_values: Optional[Cache] = None,
+        prompt_key_values: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
         output_attentions: bool = False,
         use_cache: bool = False,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
+        if prompt_key_values is not None:
+            raise NotImplementedError(
+                "BiTA prompt key-values are currently only supported on the sdpa "
+                "attention backend."
+            )
         bsz, q_len, _ = hidden_states.size()
 
         past_seen_tokens = (
@@ -876,9 +904,15 @@ class LlamaFlashAttention(LlamaAttention):
         attention_mask: Optional[torch.Tensor] = None,
         position_ids: Optional[torch.LongTensor] = None,
         past_key_values: Optional[Cache] = None,
+        prompt_key_values: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
         output_attentions: bool = False,
         use_cache: bool = False,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
+        if prompt_key_values is not None:
+            raise NotImplementedError(
+                "BiTA prompt key-values are currently only supported on the sdpa "
+                "attention backend."
+            )
         bsz, q_len, _ = hidden_states.size()
 
         query_states = self.q_proj(hidden_states)
@@ -1005,9 +1039,15 @@ class LlamaUSPFlashAttention(LlamaAttention):
         attention_mask: Optional[torch.Tensor] = None,
         position_ids: Optional[torch.LongTensor] = None,
         past_key_values: Optional[Cache] = None,
+        prompt_key_values: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
         output_attentions: bool = False,
         use_cache: bool = False,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
+        if prompt_key_values is not None:
+            raise NotImplementedError(
+                "BiTA prompt key-values are currently only supported on the sdpa "
+                "attention backend."
+            )
 
         bsz, q_len, _ = hidden_states.size()
         local_q_len = q_len
@@ -1263,6 +1303,7 @@ class LlamaDecoderLayer(nn.Module):
         attention_mask: Optional[torch.Tensor] = None,
         position_ids: Optional[torch.LongTensor] = None,
         past_key_values: Optional[Cache] = None,
+        prompt_key_values: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
         output_attentions: Optional[bool] = False,
         use_cache: Optional[bool] = False,
     ) -> Tuple[
@@ -1295,6 +1336,7 @@ class LlamaDecoderLayer(nn.Module):
             attention_mask=attention_mask,
             position_ids=position_ids,
             past_key_values=past_key_values,
+            prompt_key_values=prompt_key_values,
             output_attentions=output_attentions,
             use_cache=use_cache,
         )
@@ -1313,11 +1355,23 @@ class LlamaDecoderLayer(nn.Module):
 class LlamaForCausalLMEagle3(Eagle3DraftModel):
 
     config_class = LlamaConfig
+    BITA_CONFIG_KEYS = (
+        "bita_mask_num",
+        "bita_mask_diff",
+        "bita_prompt_num",
+        "bita_prefix_projection",
+        "bita_prefix_hidden_size",
+        "bita_prefix_dropout_prob",
+        "bita_loss_weight",
+        "bita_max_groups",
+        "bita_window_strategy",
+    )
 
     def __init__(self, config, quant_config=None, attention_backend="sdpa") -> None:
         super().__init__(config)
         self.config = config
         self.quant_config = quant_config
+        self.attention_backend = attention_backend
 
         self.vocab_size = config.vocab_size
         self.draft_vocab_size = config.draft_vocab_size
@@ -1345,6 +1399,9 @@ class LlamaForCausalLMEagle3(Eagle3DraftModel):
         d2t = torch.zeros(self.draft_vocab_size, dtype=torch.int64)
         self.register_buffer("t2d", t2d)
         self.register_buffer("d2t", d2t)
+
+        self._apply_bita_config(config)
+        self._init_bita_modules()
 
     def forward(
         self,
@@ -1422,6 +1479,7 @@ class LlamaForCausalLMEagle3(Eagle3DraftModel):
         attention_mask: torch.Tensor,
         position_ids: torch.Tensor,
         past_key_values: Optional[Cache] = None,
+        prompt_key_values: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
         use_cache: bool = True,
     ) -> torch.Tensor:
         return self.midlayer(
@@ -1431,6 +1489,189 @@ class LlamaForCausalLMEagle3(Eagle3DraftModel):
             attention_mask=attention_mask,
             position_ids=position_ids,
             past_key_values=past_key_values,
+            prompt_key_values=prompt_key_values,
             output_attentions=False,
             use_cache=False,
         )
+
+    @property
+    def supports_bita_training(self) -> bool:
+        return (
+            (self.bita_mask_num > 0 or self.bita_prompt_num > 0)
+            and self.attention_backend == "sdpa"
+        )
+
+    def _apply_bita_config(self, source) -> None:
+        defaults = {
+            "bita_mask_num": 0,
+            "bita_mask_diff": False,
+            "bita_prompt_num": 0,
+            "bita_prefix_projection": True,
+            "bita_prefix_hidden_size": self.config.hidden_size,
+            "bita_prefix_dropout_prob": 0.0,
+            "bita_loss_weight": 1.0,
+            "bita_max_groups": 1,
+            "bita_window_strategy": "random",
+        }
+        for key, default_value in defaults.items():
+            value = (
+                source.get(key, default_value)
+                if isinstance(source, dict)
+                else getattr(source, key, default_value)
+            )
+            setattr(self, key, value)
+            setattr(self.config, key, value)
+
+        self.bita_mask_num = int(self.bita_mask_num or 0)
+        self.bita_mask_diff = bool(self.bita_mask_diff)
+        self.bita_prompt_num = int(self.bita_prompt_num or 0)
+        self.bita_prefix_projection = bool(self.bita_prefix_projection)
+        self.bita_prefix_hidden_size = int(self.bita_prefix_hidden_size)
+        self.bita_prefix_dropout_prob = float(self.bita_prefix_dropout_prob)
+        self.bita_loss_weight = float(self.bita_loss_weight)
+        self.bita_max_groups = int(self.bita_max_groups or 1)
+        self.bita_window_strategy = str(self.bita_window_strategy)
+
+    def _clear_bita_modules(self) -> None:
+        for module_name in (
+            "bita_mask_tokens",
+            "bita_prefix_encoder",
+            "bita_prefix_dropout",
+        ):
+            if hasattr(self, module_name):
+                delattr(self, module_name)
+        if "bita_prefix_tokens" in self._buffers:
+            del self._buffers["bita_prefix_tokens"]
+
+    def _init_bita_modules(self) -> None:
+        self._clear_bita_modules()
+
+        if self.bita_mask_num > 0:
+            mask_vocab = self.bita_mask_num if self.bita_mask_diff else 1
+            self.bita_mask_tokens = nn.Embedding(mask_vocab, self.config.hidden_size)
+
+        if self.bita_prompt_num > 0:
+            prefix_output_dim = (
+                2
+                * self.config.num_hidden_layers
+                * self.config.num_key_value_heads
+                * self.midlayer.self_attn.head_dim
+            )
+            self.bita_prefix_encoder = PrefixEncoder(
+                prompt_num=self.bita_prompt_num,
+                hidden_size=self.config.hidden_size,
+                output_dim=prefix_output_dim,
+                prefix_projection=self.bita_prefix_projection,
+                prefix_hidden_size=self.bita_prefix_hidden_size,
+            )
+            self.register_buffer(
+                "bita_prefix_tokens",
+                torch.arange(self.bita_prompt_num, dtype=torch.long),
+                persistent=False,
+            )
+            if self.bita_prefix_dropout_prob > 0:
+                self.bita_prefix_dropout = nn.Dropout(self.bita_prefix_dropout_prob)
+
+    def get_bita_config_dict(self) -> dict:
+        return {key: getattr(self, key) for key in self.BITA_CONFIG_KEYS}
+
+    def save_bita_pretrained(self, output_dir: str, state_dict=None) -> None:
+        os.makedirs(output_dir, exist_ok=True)
+        if state_dict is None:
+            state_dict = {
+                key: value.detach().cpu()
+                for key, value in self.state_dict().items()
+                if key.startswith("bita_")
+            }
+        else:
+            state_dict = {
+                key: value.detach().cpu()
+                for key, value in state_dict.items()
+                if key.startswith("bita_")
+            }
+
+        torch.save(state_dict, os.path.join(output_dir, "bita_state.pt"))
+        with open(os.path.join(output_dir, "bita_config.json"), "w") as file:
+            json.dump(self.get_bita_config_dict(), file, indent=2)
+
+    def load_bita_pretrained(self, input_dir: str, map_location: str = "cpu") -> None:
+        config_path = os.path.join(input_dir, "bita_config.json")
+        state_path = os.path.join(input_dir, "bita_state.pt")
+        if not os.path.exists(config_path):
+            raise FileNotFoundError(f"BiTA config not found at {config_path}")
+        if not os.path.exists(state_path):
+            raise FileNotFoundError(f"BiTA state not found at {state_path}")
+
+        with open(config_path, "r") as file:
+            bita_config = json.load(file)
+
+        self._apply_bita_config(bita_config)
+        self._init_bita_modules()
+
+        state_dict = torch.load(state_path, map_location=map_location)
+        missing_keys, unexpected_keys = self.load_state_dict(state_dict, strict=False)
+        unexpected_keys = [key for key in unexpected_keys if key.startswith("bita_")]
+        missing_keys = [key for key in missing_keys if key.startswith("bita_")]
+        if unexpected_keys or missing_keys:
+            raise RuntimeError(
+                "Failed to load BiTA adapter cleanly. "
+                f"Missing keys: {missing_keys}, unexpected keys: {unexpected_keys}"
+            )
+
+    def get_bita_mask_embeddings(
+        self,
+        *,
+        groups: int,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> Optional[torch.Tensor]:
+        if groups <= 0 or self.bita_mask_num <= 0:
+            return None
+        if not hasattr(self, "bita_mask_tokens"):
+            raise RuntimeError("BiTA mask embeddings are not initialized.")
+
+        if self.bita_mask_diff:
+            mask_ids = torch.arange(
+                self.bita_mask_num,
+                device=self.bita_mask_tokens.weight.device,
+                dtype=torch.long,
+            )
+        else:
+            mask_ids = torch.zeros(
+                self.bita_mask_num,
+                device=self.bita_mask_tokens.weight.device,
+                dtype=torch.long,
+            )
+        mask_ids = mask_ids.repeat(groups)
+        return self.bita_mask_tokens(mask_ids).to(device=device, dtype=dtype)
+
+    def get_bita_prompt_key_values(
+        self,
+        *,
+        batch_size: int,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> Optional[Tuple[torch.Tensor, torch.Tensor]]:
+        if self.bita_prompt_num <= 0:
+            return None
+        if not hasattr(self, "bita_prefix_encoder"):
+            raise RuntimeError("BiTA prefix encoder is not initialized.")
+
+        prompt_tokens = self.bita_prefix_tokens.unsqueeze(0).expand(batch_size, -1)
+        prompt_tokens = prompt_tokens.to(device=device)
+        prompt_kv = self.bita_prefix_encoder(prompt_tokens)
+        prompt_len = prompt_kv.shape[1]
+        prompt_kv = prompt_kv.view(
+            batch_size,
+            prompt_len,
+            self.config.num_hidden_layers,
+            2,
+            self.config.num_key_value_heads,
+            self.midlayer.self_attn.head_dim,
+        )
+        if hasattr(self, "bita_prefix_dropout"):
+            prompt_kv = self.bita_prefix_dropout(prompt_kv)
+
+        prompt_kv = prompt_kv[:, :, 0].permute(2, 0, 3, 1, 4).contiguous()
+        prompt_k, prompt_v = prompt_kv[0], prompt_kv[1]
+        return prompt_k.to(dtype=dtype), prompt_v.to(dtype=dtype)
