@@ -123,7 +123,7 @@ def preprocess_conversations(
     max_length: int = 2048,
     is_preformatted: bool = False,
     train_only_last_turn: bool = False,
-    tools: Optional[List[List[Dict]]] = [[]],
+    tools: Optional[List[List[Dict]]] = None,
     **kwargs,
 ) -> Dict[str, List[torch.Tensor]]:
     """
@@ -155,6 +155,8 @@ def preprocess_conversations(
         parser = HarmonyParser(tokenizer, chat_template)
     else:
         raise ValueError(f"Invalid parser type: {chat_template.parser_type}")
+    if tools is None:
+        tools = [[] for _ in range(len(conversations))]
     kwargs_list = [{} for _ in range(len(conversations))]
     for key, value_list in kwargs.items():
         for i, value in enumerate(value_list):
@@ -163,7 +165,7 @@ def preprocess_conversations(
         if not source:
             # if the source is None, skip it
             continue
-        input_ids, loss_mask = parser.parse(
+        parsed = parser.parse(
             source,
             max_length,
             preformatted=is_preformatted,
@@ -171,6 +173,9 @@ def preprocess_conversations(
             tool=tool,
             **kwargs_item,
         )
+        if parsed is None:
+            continue
+        input_ids, loss_mask = parsed
         results["input_ids"].append(input_ids[None, :])
         results["loss_mask"].append(loss_mask[None, :])
         results["attention_mask"].append(torch.ones_like(loss_mask)[None, :])
@@ -390,7 +395,7 @@ def build_eagle3_dataset(
                 # Parse tools: handle JSON strings from safe_conversations_generator
                 tools = []
                 for tool_item in tools_raw:
-                    if isinstance(tool_item, (str, list)):
+                    if isinstance(tool_item, str):
                         try:
                             tools.append(json.loads(tool_item))
                         except json.JSONDecodeError:
@@ -400,6 +405,8 @@ def build_eagle3_dataset(
                             tools.append([])
                     elif isinstance(tool_item, list):
                         tools.append(tool_item)
+                    elif isinstance(tool_item, dict):
+                        tools.append([tool_item])
                     elif tool_item is None:
                         tools.append([])
                     else:

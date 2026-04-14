@@ -2,10 +2,11 @@ import json
 import re
 import warnings
 from abc import ABC, abstractmethod
-from typing import Dict, List, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import torch
 from transformers import PreTrainedTokenizer
+from jinja2.exceptions import TemplateError
 
 from .template import ChatTemplate
 
@@ -26,7 +27,7 @@ class Parser(ABC):
     @abstractmethod
     def parse(
         self, conversation: "Conversation", max_length: int
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
+    ) -> Optional[Tuple[torch.Tensor, torch.Tensor]]:
         """
         Parse the conversation into a list of tensors.
 
@@ -129,6 +130,71 @@ class GeneralParser(Parser):
         )
         return conversation
 
+    def _normalize_messages(self, conversation: "Conversation") -> Optional[List[dict]]:
+        if not conversation:
+            warnings.warn("Encountered an empty conversation. Skipping it.")
+            return None
+
+        messages = []
+        work_conversation = conversation
+
+        if work_conversation[0]["role"] == "system":
+            warnings.warn(
+                "The first message is from system, we will use the system prompt from the data "
+                "and ignore the system prompt from the template"
+            )
+            messages.append(
+                {"role": "system", "content": work_conversation[0]["content"]}
+            )
+            work_conversation = work_conversation[1:]
+        elif self.system_prompt:
+            messages.append({"role": "system", "content": self.system_prompt})
+
+        dropped_leading_roles = []
+        while work_conversation and work_conversation[0]["role"] != "user":
+            dropped_leading_roles.append(work_conversation[0]["role"])
+            work_conversation = work_conversation[1:]
+
+        if dropped_leading_roles:
+            warnings.warn(
+                "Conversation must start with a 'user' role, but found leading roles "
+                f"{dropped_leading_roles}. Dropping messages before the first user turn."
+            )
+
+        if not work_conversation:
+            warnings.warn(
+                "Conversation does not contain a valid 'user' turn after normalization. "
+                "Skipping it."
+            )
+            return None
+
+        for j, sentence in enumerate(work_conversation):
+            role = sentence["role"]
+            if j > 0:
+                prev_role = work_conversation[j - 1]["role"]
+                if role == "tool" and prev_role not in ["assistant", "tool"]:
+                    warnings.warn(
+                        f"A 'tool' message must follow an 'assistant' or 'tool' message, but "
+                        f"was preceded by '{prev_role}'. Conversation truncated."
+                    )
+                    break
+                if role == "assistant" and prev_role not in ["user", "tool"]:
+                    warnings.warn(
+                        f"An 'assistant' message must follow a 'user' or 'tool' message, but "
+                        f"was preceded by '{prev_role}'. Conversation truncated."
+                    )
+                    break
+            sentence = self._sanitize_message(sentence)
+            messages.append(sentence)
+
+        if not any(message["role"] == "user" for message in messages):
+            warnings.warn(
+                "No valid user turn remained after normalization. Skipping conversation."
+            )
+            return None
+
+        return messages
+
     def set_assistant_pattern(self, chat_template: ChatTemplate):
         if chat_template.assistant_pattern_type == "longcat":
             self.assistant_pattern = (
@@ -155,47 +221,26 @@ class GeneralParser(Parser):
         train_only_last_turn: bool = False,
         tool: List[Dict] = [],
         **kwargs,
-    ) -> Dict[str, List[torch.Tensor]]:
+    ) -> Optional[Tuple[torch.Tensor, torch.Tensor]]:
         if not preformatted:
-            messages = []
-
-            if conversation[0]["role"] == "system":
-                warnings.warn(
-                    f"The first message is from system, we will use the system prompt from the data and ignore the system prompt from the template"
-                )
-                messages.append(
-                    {"role": "system", "content": conversation[0]["content"]}
-                )
-                conversation = conversation[1:]
-            else:
-                if self.system_prompt:
-                    messages.append({"role": "system", "content": self.system_prompt})
-
-            for j, sentence in enumerate(conversation):
-                role = sentence["role"]
-                if j == 0:
-                    if role != "user":
-                        warnings.warn(
-                            f"Conversation must start with a 'user' role, but found '{role}'. Conversation truncated."
-                        )
-                        break
-                else:
-                    prev_role = conversation[j - 1]["role"]
-                    if role == "tool" and prev_role not in ["assistant", "tool"]:
-                        warnings.warn(
-                            f"A 'tool' message must follow an 'assistant' or 'tool' message, but was preceded by '{prev_role}'. Conversation truncated."
-                        )
-                        break
-                    if role == "assistant" and prev_role not in ["user", "tool"]:
-                        warnings.warn(
-                            f"An 'assistant' message must follow a 'user' or 'tool' message, but was preceded by '{prev_role}'. Conversation truncated."
-                        )
-                        break
-                sentence = self._sanitize_message(sentence)
-                messages.append(sentence)
+            messages = self._normalize_messages(conversation)
+            if messages is None:
+                return None
             try:
                 conversation = self.apply_chat_template(messages, tool=tool, **kwargs)
-            except (ValueError, TypeError):
+            except TemplateError as exc:
+                warnings.warn(
+                    f"Failed to render the tokenizer chat template: {exc}. "
+                    "Skipping conversation."
+                )
+                return None
+            except (AttributeError, TypeError, ValueError) as exc:
+                if getattr(self.tokenizer, "chat_template", None):
+                    warnings.warn(
+                        f"Failed to apply the tokenizer chat template: {exc}. "
+                        "Skipping conversation."
+                    )
+                    return None
                 # Fallback rendering for tokenizers without built-in chat_template
                 warnings.warn(
                     "Tokenizer does not have a chat_template, using fallback rendering."
