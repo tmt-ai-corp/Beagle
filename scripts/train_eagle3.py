@@ -820,11 +820,19 @@ def run_forward(
             is_vlm=args.is_vlm,
         )
     extra_metrics = {}
-    if len(vlosses) >= 2:
+    if args.use_bita:
+        zero = plosses[0].detach().new_zeros(())
         extra_metrics = {
-            "bita_loss": vlosses[0],
-            "bita_acc": vlosses[1],
+            "bita_loss": zero,
+            "bita_acc": zero,
+            "bita_valid": zero,
         }
+        if len(vlosses) >= 2:
+            extra_metrics = {
+                "bita_loss": vlosses[0],
+                "bita_acc": vlosses[1],
+                "bita_valid": zero.new_ones(()),
+            }
     return plosses, acces, extra_metrics
 
 
@@ -878,7 +886,41 @@ def record_metrcs(
         )
 
     if extra_metrics:
+        handled_metrics = set()
+
+        if "bita_valid" in extra_metrics:
+            local_valid = extra_metrics["bita_valid"].detach().clone()
+            valid_sum = local_valid.clone()
+            dist.all_reduce(valid_sum, op=dist.ReduceOp.SUM)
+            valid_sum_scalar = valid_sum.item()
+            valid_fraction = valid_sum_scalar / dist.get_world_size()
+            logdict[f"{mode}/bita_valid_fraction"] = valid_fraction
+            handled_metrics.add("bita_valid")
+            print_on_rank0(
+                f"{mode.title()} - Step {global_step} [{global_step + 1}/{args.num_epochs}], "
+                f"bita_valid_fraction: {valid_fraction:.4f}"
+            )
+
+            for metric_name in ("bita_loss", "bita_acc"):
+                if metric_name not in extra_metrics:
+                    continue
+                metric_tensor = extra_metrics[metric_name].detach().clone() * local_valid
+                dist.all_reduce(metric_tensor, op=dist.ReduceOp.SUM)
+                metric_scalar = (
+                    metric_tensor.item() / valid_sum_scalar
+                    if valid_sum_scalar > 0
+                    else 0.0
+                )
+                logdict[f"{mode}/{metric_name}"] = metric_scalar
+                handled_metrics.add(metric_name)
+                print_on_rank0(
+                    f"{mode.title()} - Step {global_step} [{global_step + 1}/{args.num_epochs}], "
+                    f"{metric_name}: {metric_scalar:.4f}"
+                )
+
         for metric_name, metric_value in extra_metrics.items():
+            if metric_name in handled_metrics:
+                continue
             metric_tensor = metric_value.detach().clone()
             dist.all_reduce(metric_tensor, op=dist.ReduceOp.AVG)
             metric_scalar = metric_tensor.item()
@@ -1159,11 +1201,37 @@ def main():
 
                 averaged_eval_extra_metrics = None
                 if eval_extra_metrics:
-                    averaged_eval_extra_metrics = {
-                        name: torch.stack(values).mean()
-                        for name, values in eval_extra_metrics.items()
-                        if len(values) > 0
-                    }
+                    averaged_eval_extra_metrics = {}
+                    handled_metrics = set()
+
+                    if "bita_valid" in eval_extra_metrics and len(
+                        eval_extra_metrics["bita_valid"]
+                    ) > 0:
+                        valid_values = torch.stack(eval_extra_metrics["bita_valid"])
+                        valid_sum = valid_values.sum()
+                        averaged_eval_extra_metrics["bita_valid"] = valid_values.mean()
+                        handled_metrics.add("bita_valid")
+
+                        for metric_name in ("bita_loss", "bita_acc"):
+                            if (
+                                metric_name in eval_extra_metrics
+                                and len(eval_extra_metrics[metric_name]) > 0
+                            ):
+                                metric_values = torch.stack(eval_extra_metrics[metric_name])
+                                if valid_sum.item() > 0:
+                                    averaged_eval_extra_metrics[metric_name] = (
+                                        metric_values * valid_values
+                                    ).sum() / valid_sum
+                                else:
+                                    averaged_eval_extra_metrics[metric_name] = (
+                                        metric_values[0].detach().clone().zero_()
+                                    )
+                                handled_metrics.add(metric_name)
+
+                    for name, values in eval_extra_metrics.items():
+                        if name in handled_metrics or len(values) == 0:
+                            continue
+                        averaged_eval_extra_metrics[name] = torch.stack(values).mean()
 
                 record_metrcs(
                     args,
