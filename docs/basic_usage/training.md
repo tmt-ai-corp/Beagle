@@ -53,6 +53,21 @@ This path currently has a few intentional constraints:
 - The training output directory stores the standalone BiTA adapter checkpoint, not a rewritten full draft checkpoint.
 - You can later reconstruct the full experiment by loading the frozen base draft from `BASE_DRAFT_CKPT` and the trained BiTA adapter from the BiTA output directory.
 
+### OneBit linear conversion on top of an existing Eagle3 draft
+
+For a second-stage experiment where you start from a trained dense Eagle3 draft, convert its linear layers to OneBit modules, and continue with the standard Eagle3 loss, use:
+
+```bash
+bash ./examples/run_llama3.1_8b_eagle3_onebit_online_h100.sh
+```
+
+This path is intentionally independent from the BiTA path:
+
+- It expects a trained dense draft checkpoint in `BASE_DRAFT_CKPT`.
+- The script converts the draft's linear layers in-place to OneBit modules and then runs the normal Eagle3 objective.
+- The saved checkpoints are full draft checkpoints with `use_onebit=true` recorded in `config.json`, so they can be resumed directly with `from_pretrained`.
+- By default, `lm_head` stays dense for stability. Set `ONEBIT_INCLUDE_LM_HEAD=1` if you want to quantize it too.
+
 ## 💨 Offline Training
 
 The difference between online and offline training is that we need to generate the hidden states before training. We also use ShareGPT and Llama3-8B-Instruct as an example.

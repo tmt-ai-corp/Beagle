@@ -1,4 +1,5 @@
 import argparse
+import copy
 import hashlib
 import math
 import os
@@ -233,6 +234,36 @@ def parse_args() -> Tuple[ArgumentParser, Namespace]:
         help="Use a two-layer MLP to project BiTA prompt embeddings into KV tensors.",
     )
 
+    onebit_group = parser.add_argument_group("onebit")
+    onebit_group.add_argument(
+        "--use-onebit",
+        action="store_true",
+        help="Convert draft linear layers to OneBit modules before Eagle3 training.",
+    )
+    onebit_group.add_argument(
+        "--onebit-quant-func",
+        type=str,
+        default="STEBinary",
+        choices=["STEBinary", "SmoothSign"],
+        help="Binary surrogate function used by converted OneBit linear layers.",
+    )
+    onebit_group.add_argument(
+        "--onebit-is-po2",
+        action="store_true",
+        help="Quantize OneBit channel scales with the placeholder power-of-two interface.",
+    )
+    onebit_group.add_argument(
+        "--onebit-include-lm-head",
+        action="store_true",
+        help="Also convert the draft lm_head to OneBit. Disabled by default for stability.",
+    )
+    onebit_group.add_argument(
+        "--onebit-add-layernorm",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Keep the LittleBit-style LayerNorm inside each converted OneBit linear layer.",
+    )
+
     # data processing type
     optimization_group = parser.add_argument_group("optimization")
     optimization_group.add_argument(
@@ -406,6 +437,10 @@ def sanity_check(args: Namespace) -> None:
     """
     args.dp_size = dist.get_world_size() // args.tp_size
     args.target_batch_size = args.tp_size * args.batch_size
+    if args.use_bita and args.use_onebit:
+        raise ValueError(
+            "The current research code supports --use-bita and --use-onebit independently, not together."
+        )
     if args.use_bita:
         if args.ckpt_dir is None:
             raise ValueError(
@@ -423,6 +458,10 @@ def sanity_check(args: Namespace) -> None:
             raise ValueError("--bita-max-groups must be > 0 when --use-bita is set.")
         if args.bita_prompt_num < 0:
             raise ValueError("--bita-prompt-num must be >= 0.")
+    if args.use_onebit and args.ckpt_dir is None and not args.resume:
+        raise ValueError(
+            "--ckpt-dir must point to a trained dense draft checkpoint when --use-onebit is set."
+        )
     if args.attention_backend == "usp":
         sp_sanity_check(args)
 
@@ -484,6 +523,28 @@ def apply_bita_config_overrides(
     return draft_model_config
 
 
+def apply_onebit_config_overrides(
+    args: Namespace, draft_model_config: AutoDraftModelConfig
+) -> AutoDraftModelConfig:
+    existing_use_onebit = bool(getattr(draft_model_config, "use_onebit", False))
+    setattr(draft_model_config, "use_onebit", args.use_onebit or existing_use_onebit)
+
+    if not existing_use_onebit:
+        setattr(draft_model_config, "onebit_quant_func", args.onebit_quant_func)
+        setattr(draft_model_config, "onebit_is_po2", args.onebit_is_po2)
+        setattr(
+            draft_model_config,
+            "onebit_include_lm_head",
+            args.onebit_include_lm_head,
+        )
+        setattr(
+            draft_model_config,
+            "onebit_add_layernorm",
+            args.onebit_add_layernorm,
+        )
+    return draft_model_config
+
+
 def build_draft_model(args: Namespace) -> Tuple[AutoDraftModelConfig, nn.Module]:
     # ckpt info(epoch, step)
     ckpt_info = (0, 0)
@@ -501,14 +562,13 @@ def build_draft_model(args: Namespace) -> Tuple[AutoDraftModelConfig, nn.Module]
 
     # Handle base ckpt, config file
     base_draft_checkpoint = None
+    config_source_checkpoint = None
     bita_checkpoint_to_load = args.bita_ckpt_dir
     is_resume_checkpoint = False
     if args.ckpt_dir is not None:
         if os.path.isdir(args.ckpt_dir):
-            draft_model_config = AutoDraftModelConfig.from_file(
-                os.path.join(args.ckpt_dir, "config.json")
-            )
             base_draft_checkpoint = args.ckpt_dir
+            config_source_checkpoint = args.ckpt_dir
             print_on_rank0(f"Finetuning from base model: {base_draft_checkpoint}")
         else:
             raise ValueError(
@@ -526,22 +586,60 @@ def build_draft_model(args: Namespace) -> Tuple[AutoDraftModelConfig, nn.Module]
             bita_checkpoint_to_load = resume_checkpoint
         else:
             base_draft_checkpoint = resume_checkpoint
+            config_source_checkpoint = resume_checkpoint
+
+    if config_source_checkpoint is not None:
+        draft_model_config = AutoDraftModelConfig.from_file(
+            os.path.join(config_source_checkpoint, "config.json")
+        )
+
+    checkpoint_uses_onebit = bool(getattr(draft_model_config, "use_onebit", False))
+    if args.use_bita and checkpoint_uses_onebit:
+        raise ValueError(
+            "The current research code does not support applying BiTA on top of a OneBit draft checkpoint."
+        )
 
     draft_model_config = apply_bita_config_overrides(args, draft_model_config)
+    draft_model_config = apply_onebit_config_overrides(args, draft_model_config)
+
+    should_convert_dense_checkpoint_to_onebit = bool(
+        getattr(draft_model_config, "use_onebit", False)
+    ) and not checkpoint_uses_onebit
+
+    model_init_config = draft_model_config
+    if should_convert_dense_checkpoint_to_onebit:
+        model_init_config = type(draft_model_config).from_dict(
+            copy.deepcopy(draft_model_config.to_dict())
+        )
+        setattr(model_init_config, "use_onebit", False)
 
     if base_draft_checkpoint:
         draft_model = AutoEagle3DraftModel.from_pretrained(
             base_draft_checkpoint,
-            config=draft_model_config,
+            config=model_init_config,
             attention_backend=args.attention_backend,
             torch_dtype=torch.bfloat16,
         ).cuda()
     else:
         draft_model = AutoEagle3DraftModel.from_config(
-            draft_model_config,
+            model_init_config,
             attention_backend=args.attention_backend,
             torch_dtype=torch.bfloat16,
         ).cuda()
+
+    if should_convert_dense_checkpoint_to_onebit:
+        if not hasattr(draft_model, "convert_linear_layers_to_onebit"):
+            raise NotImplementedError(
+                f"{draft_model.__class__.__name__} does not support OneBit conversion."
+            )
+        draft_model.convert_linear_layers_to_onebit(do_train=True)
+        print_on_rank0(
+            "Converted dense draft linear layers to OneBit modules and will continue Eagle3 training."
+        )
+    elif getattr(draft_model_config, "use_onebit", False):
+        print_on_rank0(
+            f"Loaded an existing OneBit draft checkpoint from {base_draft_checkpoint or 'config'}."
+        )
 
     # Load training state (optimizer, scheduler, epoch, step) for true resume
     resume_state = None
@@ -576,6 +674,7 @@ def build_draft_model(args: Namespace) -> Tuple[AutoDraftModelConfig, nn.Module]
         print_on_rank0("Froze all base draft parameters and left only BiTA parameters trainable.")
     else:
         draft_model.freeze_embedding()
+    draft_model_config = draft_model.config
     return draft_model_config, draft_model, ckpt_info, resume_state
 
 

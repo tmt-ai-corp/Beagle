@@ -13,6 +13,7 @@ from specforge.modeling.draft.llama3_eagle import (
     LlamaMLP,
     LlamaRMSNorm,
 )
+from specforge.modeling.draft.onebit import OneBitLinear
 
 # from model_module import LlamaForCausalLMEagle3
 
@@ -288,6 +289,68 @@ class TestLlamaForCausalLMEagle3Loading(unittest.TestCase):
         for name, param in model.named_parameters():
             if name.startswith("bita_"):
                 self.assertTrue(torch.equal(param, dict(reloaded.named_parameters())[name]))
+
+    def test_onebit_conversion_helpers(self):
+        config = LlamaConfig(
+            vocab_size=1024,
+            draft_vocab_size=512,
+            hidden_size=128,
+            intermediate_size=256,
+            num_attention_heads=8,
+            num_key_value_heads=4,
+            num_hidden_layers=1,
+            max_position_embeddings=128,
+            pad_token_id=0,
+        )
+
+        model = LlamaForCausalLMEagle3(config, attention_backend="sdpa")
+        model.convert_linear_layers_to_onebit(do_train=True)
+
+        self.assertTrue(model.use_onebit)
+        self.assertIsInstance(model.fc, OneBitLinear)
+        self.assertIsInstance(model.midlayer.self_attn.q_proj, OneBitLinear)
+        self.assertIsInstance(model.midlayer.mlp.gate_proj, OneBitLinear)
+        self.assertIsInstance(model.lm_head, torch.nn.Linear)
+        self.assertTrue(hasattr(model.fc, "in_channel_scale"))
+        self.assertTrue(hasattr(model.fc, "out_channel_scale"))
+
+    def test_onebit_save_and_load(self):
+        config = LlamaConfig(
+            vocab_size=1024,
+            draft_vocab_size=512,
+            hidden_size=128,
+            intermediate_size=256,
+            num_attention_heads=8,
+            num_key_value_heads=4,
+            num_hidden_layers=1,
+            max_position_embeddings=128,
+            pad_token_id=0,
+            use_onebit=True,
+            onebit_quant_func="STEBinary",
+            onebit_add_layernorm=True,
+        )
+
+        model = LlamaForCausalLMEagle3(config, attention_backend="sdpa")
+        torch.nn.init.normal_(model.fc.weight)
+        torch.nn.init.normal_(model.fc.in_channel_scale)
+        torch.nn.init.normal_(model.fc.out_channel_scale)
+
+        model_dir = os.path.join(self.temp_dir, "onebit_model")
+        model.save_pretrained(model_dir)
+
+        reloaded = LlamaForCausalLMEagle3.from_pretrained(
+            model_dir, attention_backend="sdpa"
+        )
+
+        self.assertTrue(reloaded.use_onebit)
+        self.assertIsInstance(reloaded.fc, OneBitLinear)
+        self.assertTrue(torch.equal(model.fc.weight, reloaded.fc.weight))
+        self.assertTrue(
+            torch.equal(model.fc.in_channel_scale, reloaded.fc.in_channel_scale)
+        )
+        self.assertTrue(
+            torch.equal(model.fc.out_channel_scale, reloaded.fc.out_channel_scale)
+        )
 
 
 if __name__ == "__main__":

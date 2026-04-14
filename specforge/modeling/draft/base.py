@@ -192,6 +192,10 @@ class Eagle3DraftModel(PreTrainedModel, ABC):
     def supports_bita_training(self) -> bool:
         return False
 
+    @property
+    def supports_onebit_training(self) -> bool:
+        return False
+
     def freeze_non_bita_parameters(self) -> None:
         if not self.supports_bita_training:
             raise NotImplementedError(
@@ -209,4 +213,9 @@ class Eagle3DraftModel(PreTrainedModel, ABC):
     def load_bita_pretrained(self, input_dir: str, map_location: str = "cpu") -> None:
         raise NotImplementedError(
             f"{self.__class__.__name__} does not implement BiTA checkpoint loading."
+        )
+
+    def convert_linear_layers_to_onebit(self, do_train: bool = True) -> None:
+        raise NotImplementedError(
+            f"{self.__class__.__name__} does not implement OneBit conversion."
         )

@@ -25,6 +25,7 @@ from ...distributed import get_sp_ring_group, get_sp_ulysses_group
 from ...layers.ring import ring_flash_attn_func
 from .bita import PrefixEncoder
 from .base import Eagle3DraftModel
+from .onebit import patch_linears_to_onebit
 
 try:
     from flash_attn import flash_attn_func
@@ -1366,6 +1367,13 @@ class LlamaForCausalLMEagle3(Eagle3DraftModel):
         "bita_max_groups",
         "bita_window_strategy",
     )
+    ONEBIT_CONFIG_KEYS = (
+        "use_onebit",
+        "onebit_quant_func",
+        "onebit_is_po2",
+        "onebit_include_lm_head",
+        "onebit_add_layernorm",
+    )
 
     def __init__(self, config, quant_config=None, attention_backend="sdpa") -> None:
         super().__init__(config)
@@ -1402,6 +1410,8 @@ class LlamaForCausalLMEagle3(Eagle3DraftModel):
 
         self._apply_bita_config(config)
         self._init_bita_modules()
+        self._apply_onebit_config(config)
+        self._init_onebit_modules(do_train=False)
 
     def forward(
         self,
@@ -1571,6 +1581,53 @@ class LlamaForCausalLMEagle3(Eagle3DraftModel):
             )
             if self.bita_prefix_dropout_prob > 0:
                 self.bita_prefix_dropout = nn.Dropout(self.bita_prefix_dropout_prob)
+
+    @property
+    def supports_onebit_training(self) -> bool:
+        return True
+
+    def _apply_onebit_config(self, source) -> None:
+        defaults = {
+            "use_onebit": False,
+            "onebit_quant_func": "STEBinary",
+            "onebit_is_po2": False,
+            "onebit_include_lm_head": False,
+            "onebit_add_layernorm": True,
+        }
+        for key, default_value in defaults.items():
+            value = (
+                source.get(key, default_value)
+                if isinstance(source, dict)
+                else getattr(source, key, default_value)
+            )
+            setattr(self, key, value)
+            setattr(self.config, key, value)
+
+        self.use_onebit = bool(self.use_onebit)
+        self.onebit_quant_func = str(self.onebit_quant_func)
+        self.onebit_is_po2 = bool(self.onebit_is_po2)
+        self.onebit_include_lm_head = bool(self.onebit_include_lm_head)
+        self.onebit_add_layernorm = bool(self.onebit_add_layernorm)
+
+    def _init_onebit_modules(self, do_train: bool) -> None:
+        if not self.use_onebit:
+            return
+        patch_linears_to_onebit(
+            self,
+            do_train=do_train,
+            quant_func_name=self.onebit_quant_func,
+            is_po2=self.onebit_is_po2,
+            include_lm_head=self.onebit_include_lm_head,
+            add_layernorm=self.onebit_add_layernorm,
+        )
+
+    def convert_linear_layers_to_onebit(self, do_train: bool = True) -> None:
+        self.use_onebit = True
+        self.config.use_onebit = True
+        self._init_onebit_modules(do_train=do_train)
+
+    def get_onebit_config_dict(self) -> dict:
+        return {key: getattr(self, key) for key in self.ONEBIT_CONFIG_KEYS}
 
     def get_bita_config_dict(self) -> dict:
         return {key: getattr(self, key) for key in self.BITA_CONFIG_KEYS}
