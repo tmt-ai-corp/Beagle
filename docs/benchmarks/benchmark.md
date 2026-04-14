@@ -11,6 +11,7 @@ We provide a unified script to test the performance of the Speculative Decoding 
 `bench_eagle3.py` can help you launch a SGLang server process and a Benchmarking process concurrently. In this way, you don't have to launch the SGLang server manually, this script will manually handle the SGLang launch under different speculative decoding configurations. Some important arguments are:
 - `--model-path`: the path to the target model.
 - `--speculative-draft-model-path`: the path to the draft model.
+- `--speculative-bita-model-path`: optional path to the standalone BiTA adapter that should be attached to the draft model.
 - `--port`: the port to launch the SGLang server.
 - `--trust-remote-code`: trust the remote code.
 - `--mem-fraction-static`: the memory fraction for the static memory.
@@ -23,6 +24,7 @@ We provide a unified script to test the performance of the Speculative Decoding 
 python3 bench_eagle3.py \
     --model-path meta-llama/Llama-3.1-8B-Instruct \
     --speculative-draft-model-path lmsys/sglang-EAGLE3-LLaMA3.1-Instruct-8B \
+    --speculative-bita-model-path /path/to/bita_adapter \
     --port 30000 \
     --trust-remote-code \
     --mem-fraction-static 0.8 \
@@ -35,14 +37,15 @@ python3 bench_eagle3.py \
 
 ### Launch Benchmarker Independently
 
-If you want to launch the SGLang server independently, you can use the following command.
+If you want to launch the SGLang server independently, you can use the following command. Prepend `PYTHONPATH=/path/to/SpecForge`, so the runtime patch can extend the SGLang CLI with the BiTA adapter flag.
 
 ```shell
 # you can launch a server
-python3 -m sglang.launch_server \
+PYTHONPATH=/path/to/SpecForge python3 -m sglang.launch_server \
     --model meta-llama/Llama-3.1-8B-Instruct \
     --speculative-algorithm EAGLE3 \
     --speculative-draft-model-path lmsys/sglang-EAGLE3-LLaMA3.1-Instruct-8B \
+    --speculative-bita-model-path /path/to/bita_adapter \
     --speculative-num-steps 3 \
     --speculative-eagle-topk 1 \
     --speculative-num-draft-tokens 4 \

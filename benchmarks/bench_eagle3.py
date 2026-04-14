@@ -21,6 +21,7 @@ python3 -m sglang.launch_server \
     --model meta-llama/Llama-3.1-8B-Instruct   \
     --speculative-algorithm EAGLE3 \
     --speculative-draft-model-path lmsys/sglang-EAGLE3-LLaMA3.1-Instruct-8B \
+    --speculative-bita-model-path /path/to/bita_adapter \
     --speculative-num-steps 3 \
     --speculative-eagle-topk 1 \
     --speculative-num-draft-tokens 4 \
@@ -44,21 +45,35 @@ python bench_eagle3.py \
 import argparse
 import json
 import os
+import sys
 import time
 from dataclasses import asdict
+from pathlib import Path
 from typing import List
 
+REPO_ROOT = Path(__file__).resolve().parent.parent
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
+from specforge.integrations.sglang_bita_patch import apply_sglang_bita_patch
+
+apply_sglang_bita_patch()
+
 import requests
-from benchmarker import BENCHMARKS
 from sglang.srt.server_args import ServerArgs
-from sglang.test.test_utils import kill_process_tree, popen_launch_server
-from sglang.utils import wait_for_server
 
 
 def parse_args():
     parser = argparse.ArgumentParser()
     sglang_group = parser.add_argument_group("sglang")
     ServerArgs.add_cli_args(sglang_group)
+
+    try:
+        from benchmarker import BENCHMARKS
+
+        benchmark_names = ", ".join(BENCHMARKS.benchmarks.keys())
+    except Exception:
+        benchmark_names = "mtbench, gsm8k, humaneval, math500, ceval, ..."
 
     # make the follow args a group
     benchmark_group = parser.add_argument_group("benchmark")
@@ -88,7 +103,7 @@ def parse_args():
             "math500:200",
             "ceval:200",
         ],
-        help=f"The list of benchmarks to run. The format is <benchmark-name>:<num-prompts>:<subset>,<subset>. We support the following benchmarks: {', '.join(BENCHMARKS.benchmarks.keys())}",
+        help=f"The list of benchmarks to run. The format is <benchmark-name>:<num-prompts>:<subset>,<subset>. We support the following benchmarks: {benchmark_names}",
     )
     benchmark_group.add_argument(
         "--enable-multi-turn-conversation",
@@ -110,6 +125,8 @@ def launch_sglang_server(
     """
     This function launches the SGLang server with the given server arguments.
     """
+    from sglang.test.test_utils import popen_launch_server
+
     sglang_args: List[str] = []
     if steps > 0:
         sglang_args.extend(
@@ -126,6 +143,13 @@ def launch_sglang_server(
                 server_args.speculative_draft_model_path,
             ]
         )
+        speculative_bita_model_path = getattr(
+            server_args, "speculative_bita_model_path", None
+        )
+        if speculative_bita_model_path:
+            sglang_args.extend(
+                ["--speculative-bita-model-path", speculative_bita_model_path]
+            )
 
     sglang_args.extend(
         [
@@ -164,9 +188,12 @@ def launch_sglang_server(
         timeout=timeout,
         other_args=sglang_args,
         env={
+            **os.environ,
+            "PYTHONPATH": os.pathsep.join(
+                [str(REPO_ROOT), os.environ.get("PYTHONPATH", "")]
+            ).rstrip(os.pathsep),
             "SGLANG_RECORD_STEP_TIME": "1",
             "SGLANG_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN": "1",
-            **os.environ,
         },
     )
     return process
@@ -178,6 +205,10 @@ def send_flush_cache_request(base_url: str):
 
 def main():
     args = parse_args()
+    from benchmarker import BENCHMARKS
+    from sglang.test.test_utils import kill_process_tree
+    from sglang.utils import wait_for_server
+
     server_args: ServerArgs = ServerArgs.from_cli_args(args)
     configs = [tuple(map(int, config.split(","))) for config in args.config_list]
 
@@ -204,6 +235,7 @@ def main():
 
     results = {}
     results["model"] = server_args.speculative_draft_model_path
+    results["bita_model"] = getattr(server_args, "speculative_bita_model_path", None)
 
     def run_benchmarks(batch_size: int, steps: int, topk: int, num_draft_tokens: int):
         for benchmark_name, num_prompts, subset in benchmark_list:
