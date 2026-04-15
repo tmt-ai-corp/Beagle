@@ -37,6 +37,8 @@ ONEBIT_CONFIG_KEYS = (
     "onebit_add_layernorm",
 )
 
+SPECFORGE_SGLANG_MODEL_PACKAGE = "specforge.sglang_models"
+
 
 class PrefixEncoder(nn.Module):
     def __init__(
@@ -288,6 +290,42 @@ def _resolve_checkpoint_dir(model_path: str) -> str:
         repo_id=model_path,
         allow_patterns=["*.json", "*.safetensors", "*.bin"],
     )
+
+
+def _ensure_external_model_package() -> None:
+    current = os.environ.get("SGLANG_EXTERNAL_MODEL_PACKAGE", "")
+    if current == SPECFORGE_SGLANG_MODEL_PACKAGE:
+        return
+    if current and current != SPECFORGE_SGLANG_MODEL_PACKAGE:
+        logger.warning(
+            "Overriding SGLANG_EXTERNAL_MODEL_PACKAGE=%s with %s so SpecForge's "
+            "custom speculative draft models can be loaded.",
+            current,
+            SPECFORGE_SGLANG_MODEL_PACKAGE,
+        )
+    os.environ["SGLANG_EXTERNAL_MODEL_PACKAGE"] = SPECFORGE_SGLANG_MODEL_PACKAGE
+
+
+def _load_model_config_dict(model_path: str) -> dict:
+    model_dir = _resolve_checkpoint_dir(model_path)
+    config_path = os.path.join(model_dir, "config.json")
+    with open(config_path, "r") as file:
+        return json.load(file)
+
+
+def _is_peagle_draft_model(model_path: str | None) -> bool:
+    if not model_path:
+        return False
+    try:
+        config = _load_model_config_dict(model_path)
+    except Exception:
+        logger.exception("Failed to inspect draft model config from %s", model_path)
+        return False
+
+    architectures = config.get("architectures") or []
+    if "LlamaForCausalLMPeagle" in architectures:
+        return True
+    return bool(config.get("specforge_parallel_drafting", False))
 
 
 def _load_selected_checkpoint_tensors(
@@ -1060,11 +1098,39 @@ def _patch_model_runner() -> None:
     ModelRunner._specforge_bita_patch_applied = True
 
 
+def _patch_speculative_worker_selection() -> None:
+    from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
+
+    if getattr(SpeculativeAlgorithm, "_specforge_peagle_patch_applied", False):
+        return
+
+    original_create_worker = SpeculativeAlgorithm.create_worker
+
+    def patched_create_worker(self, server_args):
+        if self.is_eagle() and _is_peagle_draft_model(
+            getattr(server_args, "speculative_draft_model_path", None)
+        ):
+            if not server_args.disable_overlap_schedule:
+                raise ValueError(
+                    "P-EAGLE runtime in SpecForge currently requires "
+                    "--disable-overlap-schedule."
+                )
+            from specforge.integrations.sglang_peagle_worker import PEagleWorker
+
+            return PEagleWorker
+        return original_create_worker(self, server_args)
+
+    SpeculativeAlgorithm.create_worker = patched_create_worker
+    SpeculativeAlgorithm._specforge_peagle_patch_applied = True
+
+
 def apply_sglang_bita_patch() -> bool:
     try:
+        _ensure_external_model_package()
         _patch_server_args()
         _patch_llama_eagle3()
         _patch_model_runner()
+        _patch_speculative_worker_selection()
     except ImportError:
         return False
     return True

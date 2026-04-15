@@ -13,6 +13,17 @@ python bench_eagle3.py \
     --benchmark-list mtbench:20 \
     --dtype bfloat16
 
+# GPT-OSS-20B P-EAGLE benchmark
+python bench_eagle3.py \
+    --model-path openai/gpt-oss-20b \
+    --speculative-algorithm EAGLE3 \
+    --speculative-draft-model-path cache/peagle/GPT-OSS-20B-P-EAGLE \
+    --disable-overlap-schedule \
+    --port 30000 \
+    --config-list 1,3,1,4 1,5,1,6 1,7,1,8 \
+    --benchmark-list mtbench:80 \
+    --dtype bfloat16
+
 
 or if you want run sglang alone.
 
@@ -29,6 +40,22 @@ python3 -m sglang.launch_server \
     --cuda-graph-max-bs 1 \
     --tp 1 \
     --trust-remote-code \
+    --host 0.0.0.0 \
+    --port 30000 \
+    --dtype bfloat16
+
+# launch P-EAGLE with a prepared local checkpoint
+python3 -m sglang.launch_server \
+    --model-path openai/gpt-oss-20b \
+    --speculative-algorithm EAGLE3 \
+    --speculative-draft-model-path cache/peagle/GPT-OSS-20B-P-EAGLE \
+    --speculative-num-steps 7 \
+    --speculative-eagle-topk 1 \
+    --speculative-num-draft-tokens 8 \
+    --disable-overlap-schedule \
+    --mem-fraction-static 0.8 \
+    --cuda-graph-max-bs 1 \
+    --tp-size 1 \
     --host 0.0.0.0 \
     --port 30000 \
     --dtype bfloat16
@@ -55,7 +82,10 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from specforge.integrations.sglang_bita_patch import apply_sglang_bita_patch
+from specforge.integrations.sglang_bita_patch import (
+    _is_peagle_draft_model,
+    apply_sglang_bita_patch,
+)
 
 apply_sglang_bita_patch()
 
@@ -150,6 +180,9 @@ def launch_sglang_server(
             sglang_args.extend(
                 ["--speculative-bita-model-path", speculative_bita_model_path]
             )
+
+        if _is_peagle_draft_model(server_args.speculative_draft_model_path):
+            sglang_args.extend(["--disable-overlap-schedule"])
 
     sglang_args.extend(
         [

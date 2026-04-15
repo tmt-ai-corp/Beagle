@@ -12,6 +12,8 @@ We provided a unified script to test the performance of the Speculative Decoding
 - `--model-path`: the path to the target model.
 - `--speculative-draft-model-path`: the path to the draft model.
 - `--speculative-bita-model-path`: optional path to the standalone BiTA adapter that should be attached to the draft model.
+- For `P-EAGLE`, first run `scripts/prepare_peagle_checkpoint.py` and point `--speculative-draft-model-path` at the prepared local directory.
+- `P-EAGLE` currently supports `topk=1` and should be launched with `--disable-overlap-schedule`.
 - `--port`: the port to launch the SGLang server.
 - `--trust-remote-code`: trust the remote code.
 - `--mem-fraction-static`: the memory fraction for the static memory.
@@ -32,6 +34,42 @@ python3 bench_eagle3.py \
     --attention-backend fa3 \
     --config-list 1,0,0,0 1,3,1,4 \
     --benchmark-list mtbench gsm8k:5 ceval:5:accountant \
+    --dtype bfloat16
+```
+
+### GPT-OSS-20B P-EAGLE
+
+Prepare the checkpoint:
+
+```bash
+python scripts/prepare_peagle_checkpoint.py \
+    --model-id amazon/GPT-OSS-20B-P-EAGLE \
+    --output-dir cache/peagle/GPT-OSS-20B-P-EAGLE
+```
+
+Run a direct P-EAGLE benchmark:
+
+```bash
+python benchmarks/bench_eagle3.py \
+    --model-path openai/gpt-oss-20b \
+    --speculative-algorithm EAGLE3 \
+    --speculative-draft-model-path cache/peagle/GPT-OSS-20B-P-EAGLE \
+    --disable-overlap-schedule \
+    --config-list 1,3,1,4 1,5,1,6 1,7,1,8 \
+    --benchmark-list mtbench:80 humaneval:164 \
+    --dtype bfloat16
+```
+
+Compare P-EAGLE against the public GPT-OSS-20B EAGLE3 draft:
+
+```bash
+python benchmarks/compare_peagle_vs_eagle3.py \
+    --model-path openai/gpt-oss-20b \
+    --eagle3-draft-model-path zhuyksir/EAGLE3-gpt-oss-20b-bf16 \
+    --peagle-draft-model-path cache/peagle/GPT-OSS-20B-P-EAGLE \
+    --eagle3-config-list 1,3,1,4 1,5,1,6 1,7,1,8 \
+    --peagle-config-list 1,3,1,4 1,5,1,6 1,7,1,8 \
+    --benchmark-list mtbench:80 humaneval:164 \
     --dtype bfloat16
 ```
 
